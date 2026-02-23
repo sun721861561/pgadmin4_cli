@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ _('Schema Diff Migration Manager') }}</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 16px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+    fieldset {
+      padding: 12px;
+      border: 1px solid #ccc;
+    }
+    label {
+      display: block;
+      margin-top: 8px;
+      font-size: 13px;
+    }
+    input, select, textarea {
+      width: 100%;
+      box-sizing: border-box;
+      margin-top: 4px;
+      padding: 6px;
+      font-size: 13px;
+    }
+    .actions {
+      margin-top: 12px;
+    }
+    button {
+      padding: 8px 14px;
+      cursor: pointer;
+    }
+    #result {
+      height: 360px;
+      font-family: "Courier New", monospace;
+      white-space: pre;
+    }
+  </style>
+</head>
+<body>
+  <h2>{{ _('Schema Diff Migration Manager') }}</h2>
+  <p>{{ _('Connect source/target databases and generate full migration SQL for all objects.') }}</p>
+
+  <div class="grid">
+    <fieldset>
+      <legend>{{ _('Source Database') }}</legend>
+      <label>Host <input id="src_host" value="127.0.0.1"></label>
+      <label>Port <input id="src_port" value="5432"></label>
+      <label>Database <input id="src_db" value="postgres"></label>
+      <label>User <input id="src_user" value="postgres"></label>
+      <label>Password <input id="src_pwd" type="password"></label>
+    </fieldset>
+
+    <fieldset>
+      <legend>{{ _('Target Database') }}</legend>
+      <label>Host <input id="tar_host" value="127.0.0.1"></label>
+      <label>Port <input id="tar_port" value="5432"></label>
+      <label>Database <input id="tar_db" value="postgres"></label>
+      <label>User <input id="tar_user" value="postgres"></label>
+      <label>Password <input id="tar_pwd" type="password"></label>
+    </fieldset>
+  </div>
+
+  <fieldset>
+    <legend>{{ _('Compare Options') }}</legend>
+    <label><input id="ignore_owner" type="checkbox"> Ignore Owner</label>
+    <label><input id="ignore_whitespaces" type="checkbox"> Ignore Whitespaces</label>
+    <label><input id="ignore_tablespace" type="checkbox"> Ignore Tablespace</label>
+    <label><input id="ignore_grants" type="checkbox"> Ignore Grants</label>
+  </fieldset>
+
+  <div class="actions">
+    <button id="run_btn">{{ _('Generate Script') }}</button>
+  </div>
+
+  <label>{{ _('Migration SQL') }}</label>
+  <textarea id="result" readonly></textarea>
+
+  <script>
+    async function runCompare() {
+      const payload = {
+        source: {
+          host: document.getElementById('src_host').value,
+          port: document.getElementById('src_port').value,
+          database: document.getElementById('src_db').value,
+          user: document.getElementById('src_user').value,
+          password: document.getElementById('src_pwd').value
+        },
+        target: {
+          host: document.getElementById('tar_host').value,
+          port: document.getElementById('tar_port').value,
+          database: document.getElementById('tar_db').value,
+          user: document.getElementById('tar_user').value,
+          password: document.getElementById('tar_pwd').value
+        },
+        compare_options: {
+          ignore_owner: document.getElementById('ignore_owner').checked,
+          ignore_whitespaces: document.getElementById('ignore_whitespaces').checked,
+          ignore_tablespace: document.getElementById('ignore_tablespace').checked,
+          ignore_grants: document.getElementById('ignore_grants').checked
+        }
+      };
+
+      const resultArea = document.getElementById('result');
+      resultArea.value = 'Generating migration SQL...';
+
+      try {
+        const query = new URLSearchParams({
+          src_host: payload.source.host,
+          src_port: payload.source.port,
+          src_db: payload.source.database,
+          src_user: payload.source.user,
+          src_pwd: payload.source.password,
+          tar_host: payload.target.host,
+          tar_port: payload.target.port,
+          tar_db: payload.target.database,
+          tar_user: payload.target.user,
+          tar_pwd: payload.target.password,
+          ignore_owner: String(payload.compare_options.ignore_owner),
+          ignore_whitespaces: String(payload.compare_options.ignore_whitespaces),
+          ignore_tablespace: String(payload.compare_options.ignore_tablespace),
+          ignore_grants: String(payload.compare_options.ignore_grants)
+        });
+        const res = await fetch(
+          '{{ url_for("schema_diff.api_migration_sql_test") }}?' + query.toString(),
+          { method: 'GET' }
+        );
+        const data = await res.json();
+        if (res.ok && data.success !== 0 && data.data && data.data.migration_sql) {
+          resultArea.value = data.data.migration_sql;
+        } else {
+          resultArea.value = JSON.stringify(data, null, 2);
+        }
+      } catch (err) {
+        resultArea.value = 'Request failed: ' + err;
+      }
+    }
+
+    document.getElementById('run_btn').addEventListener('click', runCompare);
+  </script>
+</body>
+</html>

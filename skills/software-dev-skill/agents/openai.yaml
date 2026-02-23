@@ -1,0 +1,4 @@
+interface:
+  display_name: "Software Dev Skill"
+  short_description: "API-first schema diff integration workflow."
+  default_prompt: "Use $software-dev-skill to refactor a frontend-triggered schema diff flow into interface-driven backend endpoints, connect source and target PostgreSQL databases inside the API implementation, and validate single-object diff plus full migration SQL generation on a minimal management page."
