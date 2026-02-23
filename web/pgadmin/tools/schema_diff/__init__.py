@@ -1219,6 +1219,22 @@ def _run_database_compare(source_sid, source_did, target_sid, target_did,
     return result
 
 
+def _run_schema_compare(source_sid, source_did, source_schema,
+                        target_sid, target_did, target_schema,
+                        ignore_owner, ignore_whitespaces,
+                        ignore_tablespace, ignore_grants):
+    directory_compare.count = 1
+
+    source_scid = _find_schema_id(source_sid, source_did, source_schema)
+    target_scid = _find_schema_id(target_sid, target_did, target_schema)
+
+    return _compare_node_group(
+        source_sid, source_did, target_sid, target_did,
+        source_scid, target_scid, source_schema, False,
+        ignore_owner, ignore_whitespaces, ignore_tablespace, ignore_grants
+    )
+
+
 def _extract_compare_options(compare_options):
     return (
         bool(compare_options.get('ignore_owner', False)),
@@ -1314,6 +1330,8 @@ def _run_api_schema_diff(payload, operation):
     source_payload = payload.get('source', {})
     target_payload = payload.get('target', {})
     compare_options = payload.get('compare_options', {})
+    source_schema = payload.get('source_schema')
+    target_schema = payload.get('target_schema')
 
     source_sid = source_did = target_sid = target_did = None
     try:
@@ -1329,10 +1347,25 @@ def _run_api_schema_diff(payload, operation):
         ignore_owner, ignore_whitespaces, ignore_tablespace, ignore_grants = \
             _extract_compare_options(compare_options)
 
-        comparison_rows = _run_database_compare(
-            source_sid, source_did, target_sid, target_did,
-            ignore_owner, ignore_whitespaces, ignore_tablespace, ignore_grants
-        )
+        use_schema_mode = bool(source_schema or target_schema)
+        if use_schema_mode and (not source_schema or not target_schema):
+            raise ValueError(gettext(
+                "Both source_schema and target_schema are required."
+            ))
+
+        if use_schema_mode:
+            comparison_rows = _run_schema_compare(
+                source_sid, source_did, source_schema,
+                target_sid, target_did, target_schema,
+                ignore_owner, ignore_whitespaces, ignore_tablespace,
+                ignore_grants
+            )
+        else:
+            comparison_rows = _run_database_compare(
+                source_sid, source_did, target_sid, target_did,
+                ignore_owner, ignore_whitespaces, ignore_tablespace,
+                ignore_grants
+            )
 
         if operation == 'single_object_diff':
             single_object = payload.get('single_object', {})
@@ -1362,7 +1395,10 @@ def _run_api_schema_diff(payload, operation):
             migration_sql = _build_migration_script(comparison_rows)
             data = {
                 'operation': operation,
+                'comparison_count_before_filter': len(comparison_rows),
                 'comparison_count': len(comparison_rows),
+                'source_schema': source_schema,
+                'target_schema': target_schema,
                 'migration_sql': migration_sql
             }
             if include_rows:
@@ -1440,7 +1476,9 @@ def api_migration_sql_test():
             'ignore_whitespaces': request.args.get('ignore_whitespaces') == 'true',
             'ignore_tablespace': request.args.get('ignore_tablespace') == 'true',
             'ignore_grants': request.args.get('ignore_grants') == 'true'
-        }
+        },
+        'source_schema': request.args.get('source_schema'),
+        'target_schema': request.args.get('target_schema')
     }
     return _run_api_schema_diff(payload, 'full_migration_sql')
 
