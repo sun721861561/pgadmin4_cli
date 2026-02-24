@@ -171,6 +171,51 @@ At this point you will be able to run pgAdmin 4 from the command line in either
 server or desktop mode, and access it from a web browser using the URL shown in
 the terminal once pgAdmin has started up.
 
+## Local Deployment (This Repo)
+
+Use the following steps to deploy and run this repository locally:
+
+1. Build frontend assets:
+   ```bash
+   cd $PGADMIN4_SRC
+   make install-node
+   make bundle
+   ```
+2. Prepare Python environment:
+   ```bash
+   source venv/bin/activate
+   pip install -r requirements.txt
+   ```
+3. Ensure local config exists in `web/config_local.py` (development mode example):
+   ```python
+   import os
+
+   DATA_DIR = os.path.join(os.path.dirname(__file__), 'pgadmin_data')
+   LOG_FILE = os.path.join(DATA_DIR, 'pgadmin4.log')
+   SQLITE_PATH = os.path.join(DATA_DIR, 'pgadmin4-dev.db')
+
+   DEFAULT_SERVER = '127.0.0.1'
+   DEFAULT_SERVER_PORT = 5050
+
+   SERVER_MODE = False
+   MASTER_PASSWORD_REQUIRED = False
+   USE_OS_SECRET_STORAGE = False
+   ```
+4. Start pgAdmin:
+   ```bash
+   cd web
+   python pgAdmin4.py
+   ```
+5. Open:
+   - Main UI: `http://127.0.0.1:5050/browser/`
+   - Schema Diff manager page: `http://127.0.0.1:5050/schema_diff/manager`
+
+### Schema Diff Manager Notes
+
+- Click `Load Databases` for both source and target connections first.
+- Select source/target database, then click `Generate Script`.
+- `Source Schema` and `Target Schema` are required and default to `public`.
+
 Setup of an environment on Windows is somewhat more complicated unfortunately,
 please see *pkg/win32/README.txt* for complete details.
 

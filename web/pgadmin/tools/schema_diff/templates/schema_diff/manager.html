@@ -14,6 +14,12 @@
       grid-template-columns: 1fr 1fr;
       gap: 16px;
     }
+    .compare-layout {
+      display: grid;
+      grid-template-columns: 1fr 1.2fr;
+      gap: 16px;
+      margin-top: 12px;
+    }
     fieldset {
       padding: 12px;
       border: 1px solid #ccc;
@@ -32,21 +38,55 @@
     }
     .actions {
       margin-top: 12px;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
     }
     button {
       padding: 8px 14px;
       cursor: pointer;
     }
-    #result {
-      height: 360px;
+    .mono {
       font-family: "Courier New", monospace;
       white-space: pre;
+    }
+    #result {
+      height: 240px;
+    }
+    #obj_source_ddl, #obj_target_ddl, #obj_diff_ddl {
+      height: 150px;
+    }
+    #compare_table_wrap {
+      max-height: 520px;
+      overflow: auto;
+      border: 1px solid #ddd;
+      margin-top: 8px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    th, td {
+      border-bottom: 1px solid #eee;
+      text-align: left;
+      padding: 6px;
+      vertical-align: top;
+    }
+    tr.row-clickable {
+      cursor: pointer;
+    }
+    tr.row-clickable:hover {
+      background: #f6f8fa;
+    }
+    tr.active-row {
+      background: #e8f0fe;
     }
   </style>
 </head>
 <body>
   <h2>{{ _('Schema Diff Migration Manager') }}</h2>
-  <p>{{ _('Connect source/target instances, choose source/target databases, and generate migration SQL.') }}</p>
+  <p>{{ _('Connect source/target instances, compare schemas, list objects, and generate migration SQL.') }}</p>
 
   <div class="grid">
     <fieldset>
@@ -61,7 +101,7 @@
       <label>Database
         <select id="src_db"></select>
       </label>
-      <label>Source Schema (optional) <input id="source_schema" placeholder="public"></label>
+      <label>Source Schema <input id="source_schema" value="public" required></label>
     </fieldset>
 
     <fieldset>
@@ -76,7 +116,7 @@
       <label>Database
         <select id="tar_db"></select>
       </label>
-      <label>Target Schema (optional) <input id="target_schema" placeholder="public"></label>
+      <label>Target Schema <input id="target_schema" value="public" required></label>
     </fieldset>
   </div>
 
@@ -89,16 +129,50 @@
   </fieldset>
 
   <div class="actions">
+    <button id="compare_btn">{{ _('Compare') }}</button>
     <button id="run_btn">{{ _('Generate Script') }}</button>
   </div>
 
   <label>{{ _('Status') }}</label>
   <textarea id="status" readonly style="height: 80px;"></textarea>
 
-  <label>{{ _('Migration SQL') }}</label>
-  <textarea id="result" readonly></textarea>
+  <div class="compare-layout">
+    <fieldset>
+      <legend>{{ _('Compared Objects') }}</legend>
+      <div id="compare_table_wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>{{ _('Object Name') }}</th>
+              <th>{{ _('Object Type') }}</th>
+            </tr>
+          </thead>
+          <tbody id="compare_rows"></tbody>
+        </table>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>{{ _('Selected Object Detail') }}</legend>
+      <label>{{ _('Source DDL') }}</label>
+      <textarea id="obj_source_ddl" class="mono" readonly></textarea>
+      <label>{{ _('Target DDL') }}</label>
+      <textarea id="obj_target_ddl" class="mono" readonly></textarea>
+      <label>{{ _('Migration SQL') }}</label>
+      <textarea id="obj_diff_ddl" class="mono" readonly></textarea>
+    </fieldset>
+  </div>
+
+  <label>{{ _('Full Migration SQL') }}</label>
+  <textarea id="result" class="mono" readonly></textarea>
 
   <script>
+    const state = {
+      lastPayload: null,
+      comparisonRows: [],
+      activeIndex: -1
+    };
+
     function setStatus(message) {
       document.getElementById('status').value = message;
     }
@@ -123,6 +197,51 @@
         }
         select.appendChild(opt);
       }
+    }
+
+    function buildPayload() {
+      return {
+        source: {
+          host: document.getElementById('src_host').value,
+          port: document.getElementById('src_port').value,
+          database: document.getElementById('src_db').value,
+          user: document.getElementById('src_user').value,
+          password: document.getElementById('src_pwd').value
+        },
+        target: {
+          host: document.getElementById('tar_host').value,
+          port: document.getElementById('tar_port').value,
+          database: document.getElementById('tar_db').value,
+          user: document.getElementById('tar_user').value,
+          password: document.getElementById('tar_pwd').value
+        },
+        compare_options: {
+          ignore_owner: document.getElementById('ignore_owner').checked,
+          ignore_whitespaces: document.getElementById('ignore_whitespaces').checked,
+          ignore_tablespace: document.getElementById('ignore_tablespace').checked,
+          ignore_grants: document.getElementById('ignore_grants').checked
+        },
+        source_schema: (document.getElementById('source_schema').value || 'public').trim(),
+        target_schema: (document.getElementById('target_schema').value || 'public').trim()
+      };
+    }
+
+    function clearObjectDetails() {
+      document.getElementById('obj_source_ddl').value = '';
+      document.getElementById('obj_target_ddl').value = '';
+      document.getElementById('obj_diff_ddl').value = '';
+    }
+
+    function ensurePayloadValid(payload) {
+      if (!payload.source.database || !payload.target.database) {
+        setStatus('Please load and select both source and target database first.');
+        return false;
+      }
+      if (!payload.source_schema || !payload.target_schema) {
+        setStatus('Source Schema and Target Schema are required.');
+        return false;
+      }
+      return true;
     }
 
     async function loadDatabases(kind) {
@@ -158,92 +277,163 @@
         const data = await res.json();
         if (res.ok && data.success !== 0 && data.data) {
           const databaseList = data.data.databases || [];
-          setSelectOptions(prefix + '_db', databaseList, data.data.selected_database || selectedDb);
+          setSelectOptions(prefix + '_db', databaseList,
+            data.data.selected_database || selectedDb);
           setStatus(label + ' databases loaded: ' + databaseList.length);
         } else {
-          setStatus('Load ' + label + ' databases failed: ' + (data.errormsg || 'Unknown error'));
+          setStatus('Load ' + label + ' databases failed: ' +
+            (data.errormsg || 'Unknown error'));
         }
       } catch (err) {
         setStatus('Load ' + label + ' databases failed: ' + err);
       }
     }
 
-    async function runCompare() {
-      const payload = {
-        source: {
-          host: document.getElementById('src_host').value,
-          port: document.getElementById('src_port').value,
-          database: document.getElementById('src_db').value,
-          user: document.getElementById('src_user').value,
-          password: document.getElementById('src_pwd').value
-        },
-        target: {
-          host: document.getElementById('tar_host').value,
-          port: document.getElementById('tar_port').value,
-          database: document.getElementById('tar_db').value,
-          user: document.getElementById('tar_user').value,
-          password: document.getElementById('tar_pwd').value
-        },
-        compare_options: {
-          ignore_owner: document.getElementById('ignore_owner').checked,
-          ignore_whitespaces: document.getElementById('ignore_whitespaces').checked,
-          ignore_tablespace: document.getElementById('ignore_tablespace').checked,
-          ignore_grants: document.getElementById('ignore_grants').checked
-        },
-        source_schema: document.getElementById('source_schema').value,
-        target_schema: document.getElementById('target_schema').value
-      };
+    function renderRows(rows) {
+      const tbody = document.getElementById('compare_rows');
+      tbody.innerHTML = '';
+      state.activeIndex = -1;
+      clearObjectDetails();
 
-      const resultArea = document.getElementById('result');
-      resultArea.value = 'Generating migration SQL...';
-      setStatus('Generating migration SQL...');
-
-      if (!payload.source.database || !payload.target.database) {
-        resultArea.value = '';
-        setStatus('Please load and select both source and target database first.');
+      if (!rows || rows.length === 0) {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 2;
+        td.textContent = 'No objects found.';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
         return;
       }
 
+      rows.forEach((row, idx) => {
+        const tr = document.createElement('tr');
+        tr.className = 'row-clickable';
+        tr.dataset.index = String(idx);
+
+        const nameTd = document.createElement('td');
+        nameTd.textContent = row.title || '';
+
+        const typeTd = document.createElement('td');
+        typeTd.textContent = row.type || '';
+
+        tr.appendChild(nameTd);
+        tr.appendChild(typeTd);
+        tr.addEventListener('click', () => onRowClick(idx));
+        tbody.appendChild(tr);
+      });
+    }
+
+    function setActiveRow(index) {
+      const rows = document.querySelectorAll('#compare_rows tr.row-clickable');
+      rows.forEach((row, idx) => {
+        row.classList.toggle('active-row', idx === index);
+      });
+      state.activeIndex = index;
+    }
+
+    async function onRowClick(index) {
+      const row = state.comparisonRows[index];
+      if (!row || !state.lastPayload) {
+        return;
+      }
+      setActiveRow(index);
+      setStatus('Loading object detail...');
+
+      const singleObject = {
+        object_type: row.type,
+        object_name: row.title,
+        source_oid: row.source_oid,
+        target_oid: row.target_oid
+      };
+
+      const payload = {
+        source: state.lastPayload.source,
+        target: state.lastPayload.target,
+        compare_options: state.lastPayload.compare_options,
+        source_schema: state.lastPayload.source_schema,
+        target_schema: state.lastPayload.target_schema,
+        single_object: singleObject
+      };
+
       try {
-        const query = new URLSearchParams({
-          src_host: payload.source.host,
-          src_port: payload.source.port,
-          src_db: payload.source.database,
-          src_user: payload.source.user,
-          src_pwd: payload.source.password,
-          tar_host: payload.target.host,
-          tar_port: payload.target.port,
-          tar_db: payload.target.database,
-          tar_user: payload.target.user,
-          tar_pwd: payload.target.password,
-          source_schema: payload.source_schema || '',
-          target_schema: payload.target_schema || '',
-          ignore_owner: String(payload.compare_options.ignore_owner),
-          ignore_whitespaces: String(payload.compare_options.ignore_whitespaces),
-          ignore_tablespace: String(payload.compare_options.ignore_tablespace),
-          ignore_grants: String(payload.compare_options.ignore_grants)
+        const res = await fetch('{{ url_for("schema_diff.api_object_diff") }}', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(payload)
         });
-        const res = await fetch(
-          '{{ url_for("schema_diff.api_migration_sql_test") }}?' + query.toString(),
-          { method: 'GET' }
-        );
         const data = await res.json();
-        if (res.ok && data.success !== 0 && data.data && data.data.migration_sql) {
-          resultArea.value = data.data.migration_sql;
-          setStatus('Generate script completed.');
+        if (res.ok && data.success !== 0 && data.data && data.data.object_diff_detail) {
+          const detail = data.data.object_diff_detail;
+          document.getElementById('obj_source_ddl').value = detail.source_ddl || '';
+          document.getElementById('obj_target_ddl').value = detail.target_ddl || '';
+          document.getElementById('obj_diff_ddl').value = detail.diff_ddl || '';
+          setStatus('Object detail loaded.');
         } else {
-          resultArea.value = JSON.stringify(data, null, 2);
-          setStatus('Generate script failed.');
+          document.getElementById('obj_source_ddl').value = row.source_ddl || '';
+          document.getElementById('obj_target_ddl').value = row.target_ddl || '';
+          document.getElementById('obj_diff_ddl').value = row.diff_ddl || '';
+          setStatus('Object detail fallback loaded.');
         }
       } catch (err) {
-        resultArea.value = 'Request failed: ' + err;
-        setStatus('Generate script failed: ' + err);
+        document.getElementById('obj_source_ddl').value = row.source_ddl || '';
+        document.getElementById('obj_target_ddl').value = row.target_ddl || '';
+        document.getElementById('obj_diff_ddl').value = row.diff_ddl || '';
+        setStatus('Object detail request failed: ' + err);
+      }
+    }
+
+    async function compareAndFetch(includeScript) {
+      const payload = buildPayload();
+      if (!ensurePayloadValid(payload)) {
+        return;
+      }
+      state.lastPayload = payload;
+      setStatus('Running compare...');
+      if (includeScript) {
+        document.getElementById('result').value = 'Generating migration SQL...';
+      }
+
+      try {
+        const res = await fetch('{{ url_for("schema_diff.api_migration_sql") }}', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            ...payload,
+            include_comparison_rows: true
+          })
+        });
+        const data = await res.json();
+        if (res.ok && data.success !== 0 && data.data) {
+          state.comparisonRows = data.data.comparison_rows || [];
+          renderRows(state.comparisonRows);
+          if (includeScript) {
+            document.getElementById('result').value = data.data.migration_sql || '';
+            setStatus('Compare completed. Script generated. Objects: ' + state.comparisonRows.length);
+          } else {
+            setStatus('Compare completed. Objects: ' + state.comparisonRows.length);
+          }
+        } else {
+          const msg = data.errormsg || 'Unknown error';
+          setStatus('Compare failed: ' + msg);
+          if (includeScript) {
+            document.getElementById('result').value = JSON.stringify(data, null, 2);
+          }
+          state.comparisonRows = [];
+          renderRows([]);
+        }
+      } catch (err) {
+        setStatus('Compare failed: ' + err);
+        if (includeScript) {
+          document.getElementById('result').value = 'Request failed: ' + err;
+        }
       }
     }
 
     document.getElementById('load_src_db_btn').addEventListener('click', ()=>loadDatabases('source'));
     document.getElementById('load_tar_db_btn').addEventListener('click', ()=>loadDatabases('target'));
-    document.getElementById('run_btn').addEventListener('click', runCompare);
+    document.getElementById('compare_btn').addEventListener('click', ()=>compareAndFetch(false));
+    document.getElementById('run_btn').addEventListener('click', ()=>compareAndFetch(true));
+
     setSelectOptions('src_db', [{label: 'postgres'}], 'postgres');
     setSelectOptions('tar_db', [{label: 'postgres'}], 'postgres');
     setStatus('Ready.');
