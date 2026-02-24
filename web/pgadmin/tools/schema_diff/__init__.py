@@ -20,13 +20,20 @@ from flask_babel import gettext
 from pgadmin.utils import PgAdminModule
 from pgadmin.utils.ajax import make_json_response, bad_request, \
     make_response as ajax_response, internal_server_error
-from pgadmin.model import Server, SharedServer
+from pgadmin.model import Server, SharedServer, db
 from pgadmin.tools.schema_diff.node_registry import SchemaDiffRegistry
 from pgadmin.tools.schema_diff.model import SchemaDiffModel
+import pgadmin.tools.schema_diff.directory_compare as directory_compare
 from config import PG_DEFAULT_DRIVER
 from pgadmin.utils.driver import get_driver
 from pgadmin.utils.constants import PREF_LABEL_DISPLAY, \
     ERROR_MSG_TRANS_ID_NOT_FOUND
+from pgadmin.utils.crypto import encrypt
+from pgadmin.utils.master_password import get_crypt_key
+from pgadmin.utils.csrf import pgCSRFProtect
+from pgadmin.browser.server_groups.servers.types import ServerType
+from pgadmin.browser.server_groups.servers.utils import \
+    convert_connection_parameter, check_ssl_fields, delete_adhoc_servers
 from sqlalchemy import or_
 from pgadmin.authenticate import socket_login_required
 from pgadmin import socketio
@@ -58,12 +65,19 @@ class SchemaDiffModule(PgAdminModule):
         return [
             'schema_diff.initialize',
             'schema_diff.panel',
+            'schema_diff.manager',
+            'schema_diff.manager_migration',
+            'schema_diff.api_list_databases',
             'schema_diff.servers',
             'schema_diff.databases',
             'schema_diff.schemas',
             'schema_diff.ddl_compare',
             'schema_diff.connect_server',
             'schema_diff.connect_database',
+            'schema_diff.api_compare',
+            'schema_diff.api_object_diff',
+            'schema_diff.api_migration_sql',
+            'schema_diff.api_migration_sql_test',
             'schema_diff.get_server',
             'schema_diff.close'
         ]
@@ -156,6 +170,30 @@ def panel(trans_id, editor_title):
         editor_title=editor_title,
         params=json.dumps(params)
     )
+
+
+@blueprint.route('/manager', methods=["GET"], endpoint='manager')
+@pgCSRFProtect.exempt
+@permissions_required(AllPermissionTypes.tools_schema_diff)
+@pga_login_required
+def manager():
+    """
+    Render a minimal management page for API-driven schema diff operations.
+    """
+    return render_template("schema_diff/manager.html", _=gettext)
+
+
+@blueprint.route('/manager_migration', methods=["GET"],
+                 endpoint='manager_migration')
+@pgCSRFProtect.exempt
+@permissions_required(AllPermissionTypes.tools_schema_diff)
+@pga_login_required
+def manager_migration():
+    """
+    Render a minimal GET-form page to generate migration SQL.
+    This avoids browser-side CSRF issues for local testing.
+    """
+    return render_template("schema_diff/manager_migration.html", _=gettext)
 
 
 def check_transaction_status(trans_id):
@@ -947,6 +985,575 @@ def fetch_compare_schemas(source_sid, source_did, target_sid, target_did):
                      'in_both_database': in_both_database}
 
     return schema_result
+
+
+def _cleanup_adhoc_server(sid):
+    if sid is None:
+        return
+    try:
+        manager = get_driver(PG_DEFAULT_DRIVER).connection_manager(sid)
+        manager.release()
+    except Exception:
+        app.logger.exception("Failed to release manager for adhoc sid=%s", sid)
+    try:
+        delete_adhoc_servers(sid)
+    except Exception:
+        app.logger.exception("Failed to delete adhoc server sid=%s", sid)
+
+
+def _find_database_id(sid, database_name):
+    view = SchemaDiffRegistry.get_node_view('database')
+    response = view.nodes(gid=1, sid=sid, is_schema_diff=True)
+    databases = json.loads(response.data)['data']
+    for db_item in databases:
+        if db_item.get('label') == database_name:
+            return db_item.get('_id')
+
+    raise ValueError(gettext("Database '{0}' not found.").format(database_name))
+
+
+def _list_databases(sid):
+    view = SchemaDiffRegistry.get_node_view('database')
+    response = view.nodes(gid=1, sid=sid, is_schema_diff=True)
+    databases = json.loads(response.data)['data']
+
+    result = []
+    for db_item in databases:
+        label = db_item.get('label')
+        if label:
+            result.append({
+                'label': label,
+                'id': db_item.get('_id')
+            })
+
+    # Keep output stable for UI and tests.
+    result.sort(key=lambda item: item['label'])
+    return result
+
+
+def _find_schema_id(sid, did, schema_name):
+    schemas = get_schemas(sid, did)
+    for sch in schemas or []:
+        if sch.get('label') == schema_name:
+            return sch.get('_id')
+
+    raise ValueError(gettext("Schema '{0}' not found.").format(schema_name))
+
+
+def _normalize_connection_payload(payload, label):
+    required = ['host', 'port', 'database', 'user']
+    missing = [key for key in required if not payload.get(key)]
+    if missing:
+        raise ValueError(gettext(
+            "{0} connection missing required fields: {1}"
+        ).format(label, ", ".join(missing)))
+
+    connection_params_raw = payload.get('connection_params', [])
+    if isinstance(connection_params_raw, dict):
+        connection_params = connection_params_raw
+    else:
+        connection_params = convert_connection_parameter(connection_params_raw)
+
+    if connection_params is not None:
+        _, connection_params = check_ssl_fields(connection_params)
+
+    return {
+        'server_name': payload.get('server_name') or
+        "schema_diff_{0}_{1}".format(label.lower(), current_user.id),
+        'host': payload.get('host'),
+        'port': int(payload.get('port')),
+        'maintenance_db': payload.get('database'),
+        'username': payload.get('user'),
+        'password': payload.get('password'),
+        'role': payload.get('role'),
+        'service': payload.get('service'),
+        'connection_params': connection_params
+    }
+
+
+def _create_and_connect_adhoc_server(connection_payload, label):
+    server = None
+    try:
+        conn_data = _normalize_connection_payload(connection_payload, label)
+        server = Server(
+            user_id=current_user.id,
+            servergroup_id=1,
+            name=conn_data['server_name'],
+            host=conn_data['host'],
+            port=conn_data['port'],
+            maintenance_db=conn_data['maintenance_db'],
+            username=conn_data['username'],
+            role=conn_data['role'],
+            service=conn_data['service'],
+            connection_params=conn_data['connection_params'],
+            is_adhoc=1
+        )
+        db.session.add(server)
+        db.session.commit()
+
+        crypt_key_present, crypt_key = get_crypt_key()
+        if not crypt_key_present:
+            raise ValueError(gettext('Master password is required to connect.'))
+
+        password = conn_data.get('password')
+        enc_password = None
+        if password not in (None, ''):
+            enc_password = encrypt(password, crypt_key)
+
+        driver = get_driver(PG_DEFAULT_DRIVER)
+        manager = driver.connection_manager(server.id)
+        manager.update(server)
+        conn = manager.connection()
+        status, errmsg = conn.connect(
+            password=enc_password,
+            server_types=ServerType.types()
+        )
+        if not status:
+            raise ValueError(gettext(
+                "{0} server connection failed: {1}"
+            ).format(label, errmsg))
+
+        did = _find_database_id(server.id, conn_data['maintenance_db'])
+        db_view = SchemaDiffRegistry.get_node_view('database')
+        db_view.connect(1, server.id, did)
+
+        return server.id, did
+    except Exception:
+        if server is not None and server.id is not None:
+            _cleanup_adhoc_server(server.id)
+        raise
+
+
+def _compare_node_group(source_sid, source_did, target_sid, target_did,
+                        source_scid, target_scid, group_name,
+                        is_schema_source_only, ignore_owner,
+                        ignore_whitespaces, ignore_tablespace, ignore_grants):
+    source_schema_name = None
+    if is_schema_source_only:
+        driver = get_driver(PG_DEFAULT_DRIVER)
+        source_schema_name = driver.qtIdent(None, group_name)
+
+    comparison_result = []
+    all_registered_nodes = SchemaDiffRegistry.get_registered_nodes()
+    for node_name, _ in all_registered_nodes.items():
+        view = SchemaDiffRegistry.get_node_view(node_name)
+        if hasattr(view, 'compare'):
+            res = view.compare(source_sid=source_sid,
+                               source_did=source_did,
+                               source_scid=source_scid,
+                               target_sid=target_sid,
+                               target_did=target_did,
+                               target_scid=target_scid,
+                               group_name=gettext(group_name),
+                               source_schema_name=source_schema_name,
+                               ignore_owner=ignore_owner,
+                               ignore_whitespaces=ignore_whitespaces,
+                               ignore_tablespace=ignore_tablespace,
+                               ignore_grants=ignore_grants)
+            if res is not None:
+                comparison_result.extend(res)
+
+    return comparison_result
+
+
+def _compare_database_objects_no_socket(source_sid, source_did,
+                                        target_sid, target_did,
+                                        ignore_owner, ignore_whitespaces,
+                                        ignore_tablespace, ignore_grants):
+    comparison_result = []
+    all_registered_nodes = SchemaDiffRegistry.get_registered_nodes(
+        None, 'Database')
+    for node_name, _ in all_registered_nodes.items():
+        view = SchemaDiffRegistry.get_node_view(node_name)
+        if hasattr(view, 'compare'):
+            res = view.compare(source_sid=source_sid,
+                               source_did=source_did,
+                               target_sid=target_sid,
+                               target_did=target_did,
+                               group_name=gettext('Database Objects'),
+                               ignore_owner=ignore_owner,
+                               ignore_whitespaces=ignore_whitespaces,
+                               ignore_tablespace=ignore_tablespace,
+                               ignore_grants=ignore_grants)
+            if res is not None:
+                comparison_result.extend(res)
+
+    return comparison_result
+
+
+def _build_migration_script(compare_rows):
+    header = [
+        "-- This script was generated by the Schema Diff utility in pgAdmin 4.",
+        "-- Due to circular dependencies, object order may need manual adjustment.",
+        "-- Review and test the script before applying in production.",
+        ""
+    ]
+    body = []
+    for row in compare_rows:
+        diff_sql = row.get('diff_ddl')
+        status = row.get('status')
+        if diff_sql and status in [
+            gettext('Source Only'), gettext('Target Only'), gettext('Different')
+        ]:
+            body.append(diff_sql)
+            body.append("")
+
+    return "\n".join(header + ["BEGIN;"] + body + ["END;"])
+
+
+def _run_database_compare(source_sid, source_did, target_sid, target_did,
+                          ignore_owner, ignore_whitespaces, ignore_tablespace,
+                          ignore_grants):
+    # Reset row id counter for deterministic output per request.
+    directory_compare.count = 1
+
+    result = _compare_database_objects_no_socket(
+        source_sid, source_did, target_sid, target_did,
+        ignore_owner, ignore_whitespaces, ignore_tablespace, ignore_grants
+    )
+
+    schema_result = fetch_compare_schemas(
+        source_sid, source_did, target_sid, target_did
+    )
+
+    for item in schema_result.get('source_only', []):
+        result.extend(_compare_node_group(
+            source_sid, source_did, target_sid, target_did,
+            item['scid'], None, item['schema_name'], True,
+            ignore_owner, ignore_whitespaces, ignore_tablespace, ignore_grants
+        ))
+
+    for item in schema_result.get('target_only', []):
+        result.extend(_compare_node_group(
+            source_sid, source_did, target_sid, target_did,
+            None, item['scid'], item['schema_name'], False,
+            ignore_owner, ignore_whitespaces, ignore_tablespace, ignore_grants
+        ))
+
+    for item in schema_result.get('in_both_database', []):
+        result.extend(_compare_node_group(
+            source_sid, source_did, target_sid, target_did,
+            item['src_scid'], item['tar_scid'], item['schema_name'], False,
+            ignore_owner, ignore_whitespaces, ignore_tablespace, ignore_grants
+        ))
+
+    return result
+
+
+def _run_schema_compare(source_sid, source_did, source_schema,
+                        target_sid, target_did, target_schema,
+                        ignore_owner, ignore_whitespaces,
+                        ignore_tablespace, ignore_grants):
+    directory_compare.count = 1
+
+    source_scid = _find_schema_id(source_sid, source_did, source_schema)
+    target_scid = _find_schema_id(target_sid, target_did, target_schema)
+
+    return _compare_node_group(
+        source_sid, source_did, target_sid, target_did,
+        source_scid, target_scid, source_schema, False,
+        ignore_owner, ignore_whitespaces, ignore_tablespace, ignore_grants
+    )
+
+
+def _extract_compare_options(compare_options):
+    return (
+        bool(compare_options.get('ignore_owner', False)),
+        bool(compare_options.get('ignore_whitespaces', False)),
+        bool(compare_options.get('ignore_tablespace', False)),
+        bool(compare_options.get('ignore_grants', False))
+    )
+
+
+def _find_single_object_rows(comparison_rows, single_object):
+    obj_type = single_object.get('object_type')
+    obj_name = single_object.get('object_name')
+    source_oid = single_object.get('source_oid')
+    target_oid = single_object.get('target_oid')
+
+    if not obj_type:
+        raise ValueError(gettext("single_object.object_type is required."))
+    if not obj_name and source_oid is None and target_oid is None:
+        raise ValueError(gettext(
+            "Provide single_object.object_name or "
+            "single_object.source_oid/target_oid."
+        ))
+
+    if source_oid not in (None, ''):
+        source_oid = int(source_oid)
+    else:
+        source_oid = None
+
+    if target_oid not in (None, ''):
+        target_oid = int(target_oid)
+    else:
+        target_oid = None
+
+    matched = []
+    for row in comparison_rows:
+        if row.get('type') != obj_type:
+            continue
+
+        if source_oid is not None or target_oid is not None:
+            if row.get('source_oid') == source_oid and \
+                    row.get('target_oid') == target_oid:
+                matched.append(row)
+            continue
+
+        if obj_name and row.get('title') == obj_name:
+            matched.append(row)
+
+    if len(matched) == 0:
+        if obj_name:
+            raise LookupError(
+                gettext("No diff found for object '{0}'.").format(obj_name)
+            )
+        raise LookupError(
+            gettext("No diff found for object type '{0}'.").format(obj_type)
+        )
+
+    return matched
+
+
+def _build_object_diff_detail(row, source_sid, source_did, target_sid,
+                              target_did):
+    detail = {
+        'source_ddl': row.get('source_ddl'),
+        'target_ddl': row.get('target_ddl'),
+        'diff_ddl': row.get('diff_ddl')
+    }
+
+    if row.get('source_oid') is None or row.get('target_oid') is None:
+        return detail
+
+    view = SchemaDiffRegistry.get_node_view(row.get('type'))
+    if view is None or not hasattr(view, 'ddl_compare'):
+        return detail
+
+    sql = view.ddl_compare(
+        source_sid=source_sid,
+        source_did=source_did,
+        source_scid=row.get('source_scid'),
+        target_sid=target_sid,
+        target_did=target_did,
+        target_scid=row.get('target_scid'),
+        source_oid=row.get('source_oid'),
+        target_oid=row.get('target_oid'),
+        comp_status=row.get('status')
+    )
+    detail['source_ddl'] = sql.get('source_ddl')
+    detail['target_ddl'] = sql.get('target_ddl')
+    detail['diff_ddl'] = sql.get('diff_ddl')
+    return detail
+
+
+def _run_api_schema_diff(payload, operation):
+    source_payload = payload.get('source', {})
+    target_payload = payload.get('target', {})
+    compare_options = payload.get('compare_options', {})
+    source_schema = payload.get('source_schema')
+    target_schema = payload.get('target_schema')
+
+    source_sid = source_did = target_sid = target_did = None
+    try:
+        source_sid, source_did = _create_and_connect_adhoc_server(
+            source_payload, 'Source')
+        target_sid, target_did = _create_and_connect_adhoc_server(
+            target_payload, 'Target')
+
+        valid, msg = check_version_compatibility(source_sid, target_sid)
+        if not valid:
+            return make_json_response(success=0, errormsg=msg, status=428)
+
+        ignore_owner, ignore_whitespaces, ignore_tablespace, ignore_grants = \
+            _extract_compare_options(compare_options)
+
+        use_schema_mode = bool(source_schema or target_schema)
+        if use_schema_mode and (not source_schema or not target_schema):
+            raise ValueError(gettext(
+                "Both source_schema and target_schema are required."
+            ))
+
+        if use_schema_mode:
+            comparison_rows = _run_schema_compare(
+                source_sid, source_did, source_schema,
+                target_sid, target_did, target_schema,
+                ignore_owner, ignore_whitespaces, ignore_tablespace,
+                ignore_grants
+            )
+        else:
+            comparison_rows = _run_database_compare(
+                source_sid, source_did, target_sid, target_did,
+                ignore_owner, ignore_whitespaces, ignore_tablespace,
+                ignore_grants
+            )
+
+        if operation == 'single_object_diff':
+            single_object = payload.get('single_object', {})
+            if not single_object:
+                return make_json_response(
+                    success=0,
+                    errormsg=gettext("single_object is required."),
+                    status=400
+                )
+
+            matched = _find_single_object_rows(comparison_rows, single_object)
+            object_diff = matched[0]
+            object_diff_detail = _build_object_diff_detail(
+                object_diff, source_sid, source_did, target_sid, target_did
+            )
+
+            return make_json_response(data={
+                'operation': operation,
+                'match_count': len(matched),
+                'object_diff': object_diff,
+                'object_diff_detail': object_diff_detail,
+                'matches': matched
+            })
+
+        if operation == 'full_migration_sql':
+            include_rows = bool(payload.get('include_comparison_rows', False))
+            migration_sql = _build_migration_script(comparison_rows)
+            data = {
+                'operation': operation,
+                'comparison_count_before_filter': len(comparison_rows),
+                'comparison_count': len(comparison_rows),
+                'source_schema': source_schema,
+                'target_schema': target_schema,
+                'migration_sql': migration_sql
+            }
+            if include_rows:
+                data['comparison_rows'] = comparison_rows
+            return make_json_response(data=data)
+
+        return make_json_response(
+            success=0,
+            errormsg=gettext(
+                "Invalid operation. Use 'single_object_diff' "
+                "or 'full_migration_sql'."
+            ),
+            status=400
+        )
+    except ValueError as error:
+        return make_json_response(success=0, errormsg=str(error), status=400)
+    except LookupError as error:
+        return make_json_response(success=0, errormsg=str(error), status=404)
+    except Exception as e:
+        app.logger.exception(e)
+        return internal_server_error(errormsg=str(e))
+    finally:
+        _cleanup_adhoc_server(source_sid)
+        _cleanup_adhoc_server(target_sid)
+
+
+@blueprint.route('/api/object_diff', methods=["POST"],
+                 endpoint='api_object_diff')
+@pgCSRFProtect.exempt
+@permissions_required(AllPermissionTypes.tools_schema_diff)
+@pga_login_required
+def api_object_diff():
+    payload = request.get_json(silent=True) or {}
+    return _run_api_schema_diff(payload, 'single_object_diff')
+
+
+@blueprint.route('/api/migration_sql', methods=["POST"],
+                 endpoint='api_migration_sql')
+@pgCSRFProtect.exempt
+@permissions_required(AllPermissionTypes.tools_schema_diff)
+@pga_login_required
+def api_migration_sql():
+    payload = request.get_json(silent=True) or {}
+    return _run_api_schema_diff(payload, 'full_migration_sql')
+
+
+@blueprint.route('/api/list_databases', methods=["POST"],
+                 endpoint='api_list_databases')
+@pgCSRFProtect.exempt
+@permissions_required(AllPermissionTypes.tools_schema_diff)
+@pga_login_required
+def api_list_databases():
+    """
+    Return available databases for a source/target connection payload.
+    Uses temporary ad-hoc server connection and cleans it up immediately.
+    """
+    payload = request.get_json(silent=True) or {}
+    connection_payload = payload.get('connection', {})
+    label = payload.get('label', 'Connection')
+    sid = did = None
+    try:
+        sid, did = _create_and_connect_adhoc_server(connection_payload, label)
+        databases = _list_databases(sid)
+        selected_db = None
+        if did is not None:
+            for item in databases:
+                if item.get('id') == did:
+                    selected_db = item.get('label')
+                    break
+
+        return make_json_response(data={
+            'databases': databases,
+            'selected_database': selected_db
+        })
+    except ValueError as error:
+        return make_json_response(success=0, errormsg=str(error), status=400)
+    except Exception as e:
+        app.logger.exception(e)
+        return internal_server_error(errormsg=str(e))
+    finally:
+        _cleanup_adhoc_server(sid)
+
+
+@blueprint.route('/api/migration_sql_test', methods=["GET"],
+                 endpoint='api_migration_sql_test')
+@pgCSRFProtect.exempt
+@permissions_required(AllPermissionTypes.tools_schema_diff)
+@pga_login_required
+def api_migration_sql_test():
+    """
+    Local testing endpoint for manager page.
+    Accepts source/target connection fields via query params and
+    generates full migration SQL.
+    """
+    payload = {
+        'source': {
+            'host': request.args.get('src_host'),
+            'port': request.args.get('src_port'),
+            'database': request.args.get('src_db'),
+            'user': request.args.get('src_user'),
+            'password': request.args.get('src_pwd')
+        },
+        'target': {
+            'host': request.args.get('tar_host'),
+            'port': request.args.get('tar_port'),
+            'database': request.args.get('tar_db'),
+            'user': request.args.get('tar_user'),
+            'password': request.args.get('tar_pwd')
+        },
+        'compare_options': {
+            'ignore_owner': request.args.get('ignore_owner') == 'true',
+            'ignore_whitespaces': request.args.get('ignore_whitespaces') == 'true',
+            'ignore_tablespace': request.args.get('ignore_tablespace') == 'true',
+            'ignore_grants': request.args.get('ignore_grants') == 'true'
+        },
+        'source_schema': request.args.get('source_schema'),
+        'target_schema': request.args.get('target_schema')
+    }
+    return _run_api_schema_diff(payload, 'full_migration_sql')
+
+
+@blueprint.route('/api/compare', methods=["POST"], endpoint='api_compare')
+@pgCSRFProtect.exempt
+@permissions_required(AllPermissionTypes.tools_schema_diff)
+@pga_login_required
+def api_compare():
+    """
+    Backward-compatible API endpoint.
+    operation='single_object_diff' maps to api/object_diff.
+    operation='full_migration_sql' maps to api/migration_sql.
+    """
+    payload = request.get_json(silent=True) or {}
+    operation = payload.get('operation', 'full_migration_sql')
+    return _run_api_schema_diff(payload, operation)
 
 
 def compare_pre_validation(trans_id, source_sid, target_sid):

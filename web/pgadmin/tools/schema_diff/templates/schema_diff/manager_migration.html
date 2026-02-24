@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ _('Schema Diff Migration (Simple)') }}</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 16px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    fieldset { padding: 12px; border: 1px solid #ccc; }
+    label { display: block; margin-top: 8px; font-size: 13px; }
+    input { width: 100%; box-sizing: border-box; margin-top: 4px; padding: 6px; font-size: 13px; }
+    .actions { margin-top: 12px; }
+    button { padding: 8px 14px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h2>{{ _('Schema Diff Migration (Simple)') }}</h2>
+  <p>{{ _('Use GET form submission to generate full migration SQL without JS fetch.') }}</p>
+
+  <form method="get" action="{{ url_for('schema_diff.api_migration_sql_test') }}" target="_blank">
+    <div class="grid">
+      <fieldset>
+        <legend>{{ _('Source Database') }}</legend>
+        <label>Host <input name="src_host" value="127.0.0.1"></label>
+        <label>Port <input name="src_port" value="5432"></label>
+        <label>Database <input name="src_db" value="postgres"></label>
+        <label>User <input name="src_user" value="postgres"></label>
+        <label>Password <input name="src_pwd" type="password"></label>
+        <label>Source Schema (optional) <input name="source_schema" placeholder="public"></label>
+      </fieldset>
+
+      <fieldset>
+        <legend>{{ _('Target Database') }}</legend>
+        <label>Host <input name="tar_host" value="127.0.0.1"></label>
+        <label>Port <input name="tar_port" value="5432"></label>
+        <label>Database <input name="tar_db" value="postgres"></label>
+        <label>User <input name="tar_user" value="postgres"></label>
+        <label>Password <input name="tar_pwd" type="password"></label>
+        <label>Target Schema (optional) <input name="target_schema" placeholder="public"></label>
+      </fieldset>
+    </div>
+
+    <fieldset>
+      <legend>{{ _('Compare Options') }}</legend>
+      <label><input name="ignore_owner" type="checkbox" value="true"> Ignore Owner</label>
+      <label><input name="ignore_whitespaces" type="checkbox" value="true"> Ignore Whitespaces</label>
+      <label><input name="ignore_tablespace" type="checkbox" value="true"> Ignore Tablespace</label>
+      <label><input name="ignore_grants" type="checkbox" value="true"> Ignore Grants</label>
+    </fieldset>
+
+    <div class="actions">
+      <button type="submit">{{ _('Generate Script') }}</button>
+    </div>
+  </form>
+</body>
+</html>

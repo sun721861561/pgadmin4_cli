@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ _('Schema Diff Migration Manager') }}</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 16px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+    fieldset {
+      padding: 12px;
+      border: 1px solid #ccc;
+    }
+    label {
+      display: block;
+      margin-top: 8px;
+      font-size: 13px;
+    }
+    input, select, textarea {
+      width: 100%;
+      box-sizing: border-box;
+      margin-top: 4px;
+      padding: 6px;
+      font-size: 13px;
+    }
+    .actions {
+      margin-top: 12px;
+    }
+    button {
+      padding: 8px 14px;
+      cursor: pointer;
+    }
+    #result {
+      height: 360px;
+      font-family: "Courier New", monospace;
+      white-space: pre;
+    }
+  </style>
+</head>
+<body>
+  <h2>{{ _('Schema Diff Migration Manager') }}</h2>
+  <p>{{ _('Connect source/target instances, choose source/target databases, and generate migration SQL.') }}</p>
+
+  <div class="grid">
+    <fieldset>
+      <legend>{{ _('Source Database') }}</legend>
+      <label>Host <input id="src_host" value="127.0.0.1"></label>
+      <label>Port <input id="src_port" value="5432"></label>
+      <label>User <input id="src_user" value="postgres"></label>
+      <label>Password <input id="src_pwd" type="password"></label>
+      <div class="actions">
+        <button type="button" id="load_src_db_btn">{{ _('Load Databases') }}</button>
+      </div>
+      <label>Database
+        <select id="src_db"></select>
+      </label>
+      <label>Source Schema (optional) <input id="source_schema" placeholder="public"></label>
+    </fieldset>
+
+    <fieldset>
+      <legend>{{ _('Target Database') }}</legend>
+      <label>Host <input id="tar_host" value="127.0.0.1"></label>
+      <label>Port <input id="tar_port" value="5432"></label>
+      <label>User <input id="tar_user" value="postgres"></label>
+      <label>Password <input id="tar_pwd" type="password"></label>
+      <div class="actions">
+        <button type="button" id="load_tar_db_btn">{{ _('Load Databases') }}</button>
+      </div>
+      <label>Database
+        <select id="tar_db"></select>
+      </label>
+      <label>Target Schema (optional) <input id="target_schema" placeholder="public"></label>
+    </fieldset>
+  </div>
+
+  <fieldset>
+    <legend>{{ _('Compare Options') }}</legend>
+    <label><input id="ignore_owner" type="checkbox"> Ignore Owner</label>
+    <label><input id="ignore_whitespaces" type="checkbox"> Ignore Whitespaces</label>
+    <label><input id="ignore_tablespace" type="checkbox"> Ignore Tablespace</label>
+    <label><input id="ignore_grants" type="checkbox"> Ignore Grants</label>
+  </fieldset>
+
+  <div class="actions">
+    <button id="run_btn">{{ _('Generate Script') }}</button>
+  </div>
+
+  <label>{{ _('Status') }}</label>
+  <textarea id="status" readonly style="height: 80px;"></textarea>
+
+  <label>{{ _('Migration SQL') }}</label>
+  <textarea id="result" readonly></textarea>
+
+  <script>
+    function setStatus(message) {
+      document.getElementById('status').value = message;
+    }
+
+    function setSelectOptions(selectId, items, selectedLabel) {
+      const select = document.getElementById(selectId);
+      select.innerHTML = '';
+      if (!items || items.length === 0) {
+        const opt = document.createElement('option');
+        opt.value = '';
+        opt.textContent = '-- No databases found --';
+        select.appendChild(opt);
+        return;
+      }
+
+      for (const item of items) {
+        const opt = document.createElement('option');
+        opt.value = item.label;
+        opt.textContent = item.label;
+        if (selectedLabel && item.label === selectedLabel) {
+          opt.selected = true;
+        }
+        select.appendChild(opt);
+      }
+    }
+
+    async function loadDatabases(kind) {
+      const prefix = kind === 'source' ? 'src' : 'tar';
+      const label = kind === 'source' ? 'Source' : 'Target';
+      const host = document.getElementById(prefix + '_host').value;
+      const port = document.getElementById(prefix + '_port').value;
+      const user = document.getElementById(prefix + '_user').value;
+      const password = document.getElementById(prefix + '_pwd').value;
+      const selectedDb = document.getElementById(prefix + '_db').value;
+
+      if (!host || !port || !user) {
+        setStatus(label + ' connection requires host/port/user.');
+        return;
+      }
+
+      setStatus('Loading ' + label + ' databases...');
+      try {
+        const res = await fetch('{{ url_for("schema_diff.api_list_databases") }}', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            label: label,
+            connection: {
+              host: host,
+              port: port,
+              database: selectedDb || 'postgres',
+              user: user,
+              password: password
+            }
+          })
+        });
+        const data = await res.json();
+        if (res.ok && data.success !== 0 && data.data) {
+          const databaseList = data.data.databases || [];
+          setSelectOptions(prefix + '_db', databaseList, data.data.selected_database || selectedDb);
+          setStatus(label + ' databases loaded: ' + databaseList.length);
+        } else {
+          setStatus('Load ' + label + ' databases failed: ' + (data.errormsg || 'Unknown error'));
+        }
+      } catch (err) {
+        setStatus('Load ' + label + ' databases failed: ' + err);
+      }
+    }
+
+    async function runCompare() {
+      const payload = {
+        source: {
+          host: document.getElementById('src_host').value,
+          port: document.getElementById('src_port').value,
+          database: document.getElementById('src_db').value,
+          user: document.getElementById('src_user').value,
+          password: document.getElementById('src_pwd').value
+        },
+        target: {
+          host: document.getElementById('tar_host').value,
+          port: document.getElementById('tar_port').value,
+          database: document.getElementById('tar_db').value,
+          user: document.getElementById('tar_user').value,
+          password: document.getElementById('tar_pwd').value
+        },
+        compare_options: {
+          ignore_owner: document.getElementById('ignore_owner').checked,
+          ignore_whitespaces: document.getElementById('ignore_whitespaces').checked,
+          ignore_tablespace: document.getElementById('ignore_tablespace').checked,
+          ignore_grants: document.getElementById('ignore_grants').checked
+        },
+        source_schema: document.getElementById('source_schema').value,
+        target_schema: document.getElementById('target_schema').value
+      };
+
+      const resultArea = document.getElementById('result');
+      resultArea.value = 'Generating migration SQL...';
+      setStatus('Generating migration SQL...');
+
+      if (!payload.source.database || !payload.target.database) {
+        resultArea.value = '';
+        setStatus('Please load and select both source and target database first.');
+        return;
+      }
+
+      try {
+        const query = new URLSearchParams({
+          src_host: payload.source.host,
+          src_port: payload.source.port,
+          src_db: payload.source.database,
+          src_user: payload.source.user,
+          src_pwd: payload.source.password,
+          tar_host: payload.target.host,
+          tar_port: payload.target.port,
+          tar_db: payload.target.database,
+          tar_user: payload.target.user,
+          tar_pwd: payload.target.password,
+          source_schema: payload.source_schema || '',
+          target_schema: payload.target_schema || '',
+          ignore_owner: String(payload.compare_options.ignore_owner),
+          ignore_whitespaces: String(payload.compare_options.ignore_whitespaces),
+          ignore_tablespace: String(payload.compare_options.ignore_tablespace),
+          ignore_grants: String(payload.compare_options.ignore_grants)
+        });
+        const res = await fetch(
+          '{{ url_for("schema_diff.api_migration_sql_test") }}?' + query.toString(),
+          { method: 'GET' }
+        );
+        const data = await res.json();
+        if (res.ok && data.success !== 0 && data.data && data.data.migration_sql) {
+          resultArea.value = data.data.migration_sql;
+          setStatus('Generate script completed.');
+        } else {
+          resultArea.value = JSON.stringify(data, null, 2);
+          setStatus('Generate script failed.');
+        }
+      } catch (err) {
+        resultArea.value = 'Request failed: ' + err;
+        setStatus('Generate script failed: ' + err);
+      }
+    }
+
+    document.getElementById('load_src_db_btn').addEventListener('click', ()=>loadDatabases('source'));
+    document.getElementById('load_tar_db_btn').addEventListener('click', ()=>loadDatabases('target'));
+    document.getElementById('run_btn').addEventListener('click', runCompare);
+    setSelectOptions('src_db', [{label: 'postgres'}], 'postgres');
+    setSelectOptions('tar_db', [{label: 'postgres'}], 'postgres');
+    setStatus('Ready.');
+  </script>
+</body>
+</html>
